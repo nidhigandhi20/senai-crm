@@ -1,0 +1,28 @@
+# Web framework
+fastapi
+uvicorn[standard]
+
+# Database
+sqlalchemy
+alembic
+psycopg2-binary
+pgvector
+
+# AI - all free, all local
+sentence-transformers     # embeddings
+ollama                    # local LLM client
+
+# Background jobs
+celery
+redis
+
+# Web scraping
+playwright
+beautifulsoup4
+
+# Utilities
+python-dotenv
+pydantic
+pydantic-settings
+httpx
+python-multipart

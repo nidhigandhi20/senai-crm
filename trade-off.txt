@@ -1,0 +1,1 @@
+"Chose Ollama with Llama 3.2 over the Anthropic API to keep the system fully self-hosted and cost-free. Trade-off: slightly lower reasoning quality on complex multi-step agent tasks compared to Claude Sonnet. In production, swapping to a hosted LLM is a one-line config change since the OpenAI-compatible interface is abstracted behind a service layer."
