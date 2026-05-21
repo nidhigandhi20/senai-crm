@@ -13,7 +13,9 @@ Flow for each email:
   6. Parse + validate JSON response
   7. Apply safety rules (confidence < 0.70, Critical, Legal)
   8. Write result to emails table
-  9. Write action record with reasoning trace
+  9. Run sentiment tracker — detect deterioration, trigger escalation alert
+ 10. Write action record with reasoning trace
+ 11. (Optional) Run agent if AGENT_ENABLED=true
 
 Usage:
     from classifier.engine import classify_email
@@ -34,6 +36,7 @@ from rag.pipeline import retrieve, format_rag_context
 from classifier.schemas import ClassificationResult, DetectedEntities
 from classifier.prompts import SYSTEM_PROMPT, build_user_prompt
 from heuristics.prefilter import prefilter, prefilter_to_db_status
+from sentiment.tracker import SentimentTracker
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,9 @@ BODY_TRUNCATION_LIMIT = 8000   # chars — truncate very long emails before LLM
 
 # Set to True once agent/agent.py exists
 AGENT_ENABLED = os.getenv("AGENT_ENABLED", "false").lower() == "true"
+
+# Module-level sentiment tracker singleton (stateless, safe to share)
+_sentiment_tracker = SentimentTracker()
 
 
 # ─────────────────────────────────────────
@@ -64,6 +70,7 @@ async def classify_email(email_id: int, db: Session) -> ClassificationResult | N
 
     Side effects:
         - Updates the email row with classification results
+        - Calls SentimentTracker to detect deterioration post-classification
         - Creates an Action row with the reasoning trace
         - Optionally runs the agent (if AGENT_ENABLED=true)
     """
@@ -73,6 +80,66 @@ async def classify_email(email_id: int, db: Session) -> ClassificationResult | N
     if not email:
         logger.error(f"Email {email_id} not found")
         return None
+
+    # ── IDEMPOTENCY CHECK ──────────────────────────────────────────────
+    # If this message_id has already been fully classified (status is not
+    # 'Received' or 'Processing'), return early to avoid double-processing
+    # duplicate webhook deliveries or retry storms.
+    # 'Received' and 'Processing' are the only valid entry states.
+    _ALREADY_CLASSIFIED_STATUSES = {"Escalated", "Resolved", "Ignored"}
+    if email.status in _ALREADY_CLASSIFIED_STATUSES and email.category is not None:
+        logger.info(
+            f"[IDEMPOTENCY] Email {email.message_id} already classified "
+            f"(status={email.status}, category={email.category}) — skipping duplicate run."
+        )
+        return None
+
+    # Check for duplicate message_id across all rows (separate ingestion duplicate)
+    duplicate = (
+        db.query(Email)
+        .filter(
+            Email.message_id == email.message_id,
+            Email.id         != email.id,
+            Email.category.isnot(None),   # already classified copy exists
+        )
+        .first()
+    )
+    if duplicate:
+        logger.warning(
+            f"[IDEMPOTENCY] Duplicate message_id '{email.message_id}' detected — "
+            f"a classified copy already exists (id={duplicate.id}, "
+            f"status={duplicate.status}). Marking this row as duplicate and skipping."
+        )
+        email.status = "Ignored"
+        db.commit()
+        return None
+
+    # ── MALFORMED PAYLOAD VALIDATION ──────────────────────────────────
+    # Validate required fields and sanitise before reaching the LLM.
+    # Malformed inputs are logged and given a safe fallback classification
+    # rather than raising an unhandled exception.
+    validation_error = _validate_email_payload(email)
+    if validation_error:
+        logger.error(
+            f"[VALIDATION] Email {email.message_id} failed payload validation: "
+            f"{validation_error} — routing to human review."
+        )
+        fallback = _fallback_classification(reason=f"Malformed payload: {validation_error}")
+        # Persist a minimal classification so the row is not left in limbo
+        email.category       = fallback.category
+        email.urgency        = fallback.urgency
+        email.requires_human = True
+        email.confidence     = 0.0
+        email.status         = "Escalated"
+        db.commit()
+        _write_action(
+            email_id=email_id,
+            result=fallback,
+            rag_chunks=[],
+            llm_note=f"Skipped — validation error: {validation_error}",
+            db=db,
+        )
+        return fallback
 
     # ── 2. Heuristic pre-filter ────────────────────────────────────────
     # Runs BEFORE the LLM. Catches security/spam/legal instantly.
@@ -148,7 +215,14 @@ async def classify_email(email_id: int, db: Session) -> ClassificationResult | N
         email.status          = "Escalated" if result.requires_human else "Received"
         db.commit()
 
-        # ── 10. Write reasoning trace ──────────────────────────────────
+        # ── 10. Sentiment tracker — run after classification ───────────
+        # This is the pipeline wiring that connects classification to
+        # sentiment monitoring. Previously this only ran inside get_thread_history;
+        # now it runs on every classification so the tracker stays current
+        # even for emails that don't go through the agent loop.
+        _run_sentiment_tracker(email=email, db=db)
+
+        # ── 11. Write reasoning trace ──────────────────────────────────
         _write_action(
             email_id=email_id,
             result=result,
@@ -163,7 +237,7 @@ async def classify_email(email_id: int, db: Session) -> ClassificationResult | N
             f"requires_human={result.requires_human}"
         )
 
-        # ── 11. Agent (optional) ───────────────────────────────────────
+        # ── 12. Agent (optional) ───────────────────────────────────────
         # Gated behind AGENT_ENABLED env var so classification keeps working
         # before agent/agent.py is built. Flip to true once agent is ready.
         if AGENT_ENABLED:
@@ -192,6 +266,77 @@ async def classify_email(email_id: int, db: Session) -> ClassificationResult | N
         email.status = "Received"
         db.commit()
         raise
+
+
+# ─────────────────────────────────────────
+# Sentiment tracker integration
+# ─────────────────────────────────────────
+
+def _run_sentiment_tracker(email: Email, db: Session) -> None:
+    """
+    Updates the rolling sentiment average for this sender and checks for
+    deterioration (3+ consecutive negatives → escalation alert).
+
+    Called after every successful classification so the analytics endpoint
+    and agent both see up-to-date deterioration signals.
+
+    Escalation alerts are logged and stored; the agent checks for them
+    in get_thread_history() and can act on them in the ReAct loop.
+    """
+    try:
+        # Load all classified emails from this sender (for rolling average)
+        all_emails = (
+            db.query(Email)
+            .filter(
+                Email.sender == email.sender,
+                Email.sentiment_score.isnot(None),
+            )
+            .order_by(Email.timestamp.asc())
+            .all()
+        )
+
+        scores = [e.sentiment_score for e in all_emails]
+        if not scores:
+            return
+
+        # Update the rolling average for this contact
+        _sentiment_tracker.update_rolling_average(email.sender, scores, db)
+
+        # Check for deterioration (3+ consecutive negatives)
+        deteriorating = _sentiment_tracker.detect_deterioration(email.sender, db)
+
+        if deteriorating:
+            logger.warning(
+                f"[SentimentTracker] Deterioration detected for {email.sender} "
+                f"after classifying {email.message_id} — "
+                f"scores: {scores[-5:]}"
+            )
+
+            # Create an escalation alert for the customer_success team
+            alert = _sentiment_tracker.create_escalation_alert(
+                sender_email=email.sender,
+                reason=(
+                    f"3+ consecutive negative emails detected. "
+                    f"Latest email: {email.message_id} "
+                    f"(sentiment={email.sentiment_score:.2f}). "
+                    f"Category: {email.category}. Urgency: {email.urgency}."
+                ),
+                severity="High",
+                db=db,
+            )
+
+            if alert:
+                logger.warning(
+                    f"[SentimentTracker] Escalation alert created for {email.sender}: {alert}"
+                )
+
+    except Exception as e:
+        # Non-fatal — sentiment tracking must not break classification
+        logger.error(
+            f"[SentimentTracker] Failed for {email.sender} after "
+            f"classifying {email.message_id}: {e}",
+            exc_info=True,
+        )
 
 
 # ─────────────────────────────────────────
@@ -363,6 +508,12 @@ def _write_action(
                 "policy_citations":  result.policy_citations,
             },
         },
+        {
+            "step":        "sentiment_tracking",
+            "thought":     "Running sentiment tracker to detect deterioration signals",
+            "action":      "SentimentTracker.detect_deterioration(sender)",
+            "observation": "Sentiment tracker updated; escalation alert raised if 3+ consecutive negatives detected.",
+        },
     ]
 
     if result.category == "Spam":
@@ -463,3 +614,46 @@ async def classify_by_message_id(
         logger.error(f"No email found with message_id={message_id}")
         return None
     return await classify_email(email.id, db)
+
+def _validate_email_payload(email) -> "str | None":
+    """
+    Validates required fields on an Email row before classification begins.
+
+    Returns None if valid, or a human-readable error string describing the
+    first problem found. Errors are non-fatal — callers route to human review
+    rather than raising.
+
+    Checks:
+      - sender is present and looks like a plausible email address
+      - message_id is non-empty (required for idempotency)
+      - body or subject must have some non-whitespace content
+      - timestamp must be set (needed for thread ordering + GDPR deadlines)
+      - thread_id must be set (needed for thread history queries)
+    """
+    import re as _re
+
+    # 1. sender required and must be a plausible email address
+    if not email.sender or not email.sender.strip():
+        return "sender is missing or empty"
+    if not _re.match(r"[^@\s]+@[^@\s]+\.[^@\s]+", email.sender.strip()):
+        return f"sender '{email.sender}' does not look like a valid email address"
+
+    # 2. message_id required (idempotency key)
+    if not email.message_id or not email.message_id.strip():
+        return "message_id is missing or empty — cannot guarantee idempotency"
+
+    # 3. at least one of subject or body must have content
+    subject_has_content = bool((email.subject or "").strip())
+    body_has_content    = bool((email.body    or "").strip())
+    if not subject_has_content and not body_has_content:
+        return "both subject and body are empty — nothing to classify"
+
+    # 4. timestamp required (thread ordering + GDPR deadline calculation)
+    if email.timestamp is None:
+        return "timestamp is missing — required for thread ordering and compliance deadlines"
+
+    # 5. thread_id required (thread history queries)
+    if not email.thread_id or not str(email.thread_id).strip():
+        return "thread_id is missing — required for thread history retrieval"
+
+    return None  # all checks passed

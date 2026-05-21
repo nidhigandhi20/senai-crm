@@ -18,24 +18,44 @@ Tools implemented:
     4. draft_reply(context, tone)             — LLM-generated reply draft
     5. escalate_to_human(email_id, reason)    — creates escalation record
     6. flag_for_legal(email_id, issue_type)   — legal/compliance flag + ticket
+    7. create_internal_ticket(title, body, assignee, priority)
+                                              — creates support/compliance/eng ticket
+
+Integrations:
+    - SentimentTracker:  called inside get_thread_history to detect
+                         deterioration and enrich the observation with an
+                         alert when 3+ consecutive negatives are found.
+    - WebScraper:        called inside draft_reply when churn-risk signals
+                         are present (sentiment_deteriorating=True OR the
+                         context mentions "review"/"Trustpilot"/"G2").
+                         The scraped reputation data is injected into the
+                         LLM prompt so the draft can reference it.
 """
 
 import os
 import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional, Any
 import httpx
 from sqlalchemy.orm import Session
 
 from db.models import Email, Contact, Action, Thread
 from rag.pipeline import retrieve, format_rag_context
+from sentiment.tracker import SentimentTracker
+from intelligence.scraper import WebScraper
 
 logger = logging.getLogger(__name__)
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.2")
+
+# Initialise module-level singletons (stateless, safe to share)
+_sentiment_tracker = SentimentTracker()
+_web_scraper       = WebScraper()
 
 
 # ─────────────────────────────────────────
@@ -63,8 +83,13 @@ async def get_thread_history(
     Fetches all emails from a sender, oldest first.
     Includes classification results if already classified.
 
-    Used by the agent to understand a customer's full history,
-    detect unanswered threads, and spot sentiment deterioration.
+    ── Tracker integration ──────────────────────────────────────────────
+    After loading emails, SentimentTracker.update_rolling_average() is
+    called so the contact's stored sentiment trend stays current.
+    detect_deterioration() is then called to emit an escalation alert
+    when 3+ consecutive negatives are found.  The alert is surfaced in
+    the ToolResult data so the ReAct loop can decide whether to escalate.
+    ─────────────────────────────────────────────────────────────────────
     """
     try:
         emails = (
@@ -84,26 +109,42 @@ async def get_thread_history(
 
         email_list = [
             {
-                "message_id":     e.message_id,
-                "subject":        e.subject or "(no subject)",
-                "body_preview":   (e.body or "")[:300],
-                "timestamp":      e.timestamp.isoformat() if e.timestamp else None,
-                "category":       e.category,
+                "message_id":      e.message_id,
+                "subject":         e.subject or "(no subject)",
+                "body_preview":    (e.body or "")[:300],
+                "timestamp":       e.timestamp.isoformat() if e.timestamp else None,
+                "category":        e.category,
                 "sentiment_score": e.sentiment_score,
-                "urgency":        e.urgency,
-                "requires_human": e.requires_human,
-                "status":         e.status,
+                "urgency":         e.urgency,
+                "requires_human":  e.requires_human,
+                "status":          e.status,
             }
             for e in emails
         ]
 
-        # Detect sentiment deterioration: 3+ consecutive negatives
+        # ── SentimentTracker: update rolling average ──────────────────
         scores = [e.sentiment_score for e in emails if e.sentiment_score is not None]
-        deteriorating = (
-            len(scores) >= 3 and all(s < -0.2 for s in scores[-3:])
-        )
 
-        # Count unanswered emails (Received/Escalated with no reply action)
+        if scores:
+            _sentiment_tracker.update_rolling_average(sender_email, scores, db)
+
+        # ── SentimentTracker: detect deterioration ────────────────────
+        deteriorating = _sentiment_tracker.detect_deterioration(sender_email, db)
+
+        # Emit an escalation alert record when deterioration is found
+        escalation_alert = None
+        if deteriorating:
+            escalation_alert = _sentiment_tracker.create_escalation_alert(
+                sender_email=sender_email,
+                reason="3+ consecutive negative emails detected",
+                severity="High",
+                db=db,
+            )
+            logger.warning(
+                f"[SentimentTracker] Deterioration alert raised for {sender_email}"
+            )
+
+        # Count unanswered emails (Received/Escalated with no approved reply)
         unanswered = sum(
             1 for e in emails
             if e.status in ("Received", "Escalated") and not e.requires_human
@@ -112,16 +153,18 @@ async def get_thread_history(
         return ToolResult(
             ok=True,
             data={
-                "emails":               email_list,
-                "count":                len(emails),
+                "emails":                  email_list,
+                "count":                   len(emails),
                 "sentiment_deteriorating": deteriorating,
-                "recent_scores":        scores[-5:] if scores else [],
-                "unanswered_count":     unanswered,
+                "recent_scores":           scores[-5:] if scores else [],
+                "unanswered_count":        unanswered,
+                "escalation_alert":        escalation_alert,
             },
             summary=(
                 f"{len(emails)} emails from {sender_email}. "
                 f"Sentiment deteriorating: {deteriorating}. "
                 f"Unanswered: {unanswered}."
+                + (" ⚠ ESCALATION ALERT raised." if escalation_alert else "")
             ),
         )
 
@@ -142,9 +185,6 @@ async def search_knowledge_base(
     """
     RAG search over the knowledge base.
     Returns the top-K most relevant policy chunks.
-
-    Used by the agent to look up pricing rules, SLA policies,
-    refund terms, GDPR obligations, escalation procedures, etc.
     """
     try:
         chunks = retrieve(query, top_k=top_k, db=db)
@@ -174,7 +214,7 @@ async def search_knowledge_base(
             },
             summary=(
                 f"Retrieved {len(chunks)} chunks from: "
-                + ", ".join(f"{c.source_doc}({c.similarity_score})" for c in chunks)
+                + ", ".join(f"{c.source_doc}({c.similarity_score:.2f})" for c in chunks)
             ),
         )
 
@@ -194,9 +234,6 @@ async def get_contact_profile(
     """
     Looks up a contact's CRM profile.
     Returns VIP status, ARR, churn risk, and recent activity.
-
-    Used by the agent to decide escalation priority and
-    tailor reply tone (VIP gets white-glove treatment).
     """
     try:
         contact = (
@@ -212,7 +249,6 @@ async def get_contact_profile(
                 summary=f"No CRM profile found for {email_address}.",
             )
 
-        # Derive a VIP flag from status or account value
         is_vip = (
             contact.status == "VIP"
             or (contact.account_value or 0) > 10_000
@@ -232,7 +268,7 @@ async def get_contact_profile(
         }
 
         risk_label = (
-            "HIGH" if (contact.churn_risk_score or 0) > 0.7
+            "HIGH"   if (contact.churn_risk_score or 0) > 0.7
             else "MEDIUM" if (contact.churn_risk_score or 0) > 0.4
             else "LOW"
         )
@@ -257,32 +293,149 @@ async def get_contact_profile(
 # Tool 4 — draft_reply
 # ─────────────────────────────────────────
 
+# Keywords that signal the agent should fetch web reputation data
+# before drafting, so the reply can be informed by public sentiment.
+_REPUTATION_TRIGGER_KEYWORDS = {
+    "review", "trustpilot", "g2", "g2crowd", "public review",
+    "post publicly", "social media", "twitter", "linkedin",
+}
+
+
 async def draft_reply(
     context: str,
     tone: str = "professional",
     policy_context: str = "",
     contact_name: Optional[str] = None,
+    # Extra kwargs the agent may pass
+    sender_email: Optional[str] = None,
+    company_name: Optional[str] = None,
+    sentiment_deteriorating: bool = False,   # FIX 1: always has a default, never undefined
+    db: Optional[Session] = None,
 ) -> ToolResult:
     """
     Generates a reply draft using the local Ollama LLM.
 
+    ── Scraper integration ───────────────────────────────────────────────
+    Web reputation data is fetched (via WebScraper) BEFORE calling the
+    LLM when either of these conditions is true:
+
+      1. sentiment_deteriorating=True  — tracker already confirmed 3+
+         consecutive negatives; we need public sentiment context.
+      2. The context string contains review-threat keywords
+         (e.g. "Trustpilot", "G2", "post a review").
+
+    The reputation payload (G2 rating, Trustpilot score, key themes) is
+    injected into the LLM prompt so the draft can reference it and the
+    agent's reasoning trace shows exactly what intelligence was used.
+    ─────────────────────────────────────────────────────────────────────
+
     Args:
-        context:        Description of the situation + what the reply should address
-        tone:           One of: professional, empathetic, firm, concise
-        policy_context: Relevant policy text to reference (from RAG)
-        contact_name:   Customer name for personalisation
+        context:                 Description of the situation (MUST include specific
+                                 numbers: plan name, seats, prices, discount %, days remaining).
+                                 Pass as plain English, NOT as a JSON string.
+                                 For seat additions, state NEW seats only and include the full
+                                 calculation: e.g. "5 new seats × $12/seat × (15/30) × 0.70 = $21.00"
+        tone:                    professional | empathetic | firm | concise
+        policy_context:          Relevant policy text from RAG
+        contact_name:            Customer name for personalisation
+        sender_email:            Sender address (used to look up company if
+                                 company_name is not provided)
+        company_name:            Company to scrape reputation for
+        sentiment_deteriorating: Flag from get_thread_history observation.
+                                 Defaults to False — never left undefined.
+        db:                      DB session (needed for scraper cache)
 
     Returns:
-        ToolResult with data["draft"] containing the reply text
+        ToolResult with data["draft"] and optional data["web_intel"]
     """
     greeting = f"Dear {contact_name}" if contact_name else "Dear Customer"
 
+    # ── Decide whether to fetch web intelligence ──────────────────────
+    context_lower = context.lower()
+    needs_web_intel = sentiment_deteriorating or any(
+        kw in context_lower for kw in _REPUTATION_TRIGGER_KEYWORDS
+    )
+
+    web_intel_section = ""
+    web_intel_payload = None
+
+    if needs_web_intel and (company_name or sender_email):
+        target = company_name or (sender_email.split("@")[-1].split(".")[0] if sender_email else "unknown")
+        logger.info(f"[draft_reply] Fetching web reputation for: {target}")
+
+        try:
+            web_intel_payload = await _web_scraper.get_reputation(
+                company_name=target,
+                db=db,
+            )
+
+            # Build a concise summary for the LLM prompt
+            g2    = web_intel_payload.get("g2_rating")
+            tp    = web_intel_payload.get("trustpilot")
+            note  = web_intel_payload.get("note", "")
+            themes = web_intel_payload.get("themes", [])
+
+            intel_lines = [f"Company: {target}"]
+            if g2:
+                intel_lines.append(f"G2 rating: {g2}/5")
+            if tp:
+                intel_lines.append(f"Trustpilot score: {tp}/5")
+            if themes:
+                intel_lines.append(f"Common review themes: {', '.join(themes)}")
+            if note:
+                intel_lines.append(f"Note: {note}")
+
+            web_intel_section = (
+                "\nMARKET INTELLIGENCE (public reputation data):\n"
+                + "\n".join(intel_lines)
+                + "\n"
+            )
+
+        except Exception as exc:
+            logger.warning(f"[draft_reply] Web intel fetch failed (non-fatal): {exc}")
+            web_intel_section = "\nMARKET INTELLIGENCE: Not available at this time.\n"
+
+    # ── Build prompt ──────────────────────────────────────────────────
     system = """You are a senior customer success manager drafting a reply email.
 Write clearly, professionally, and with empathy.
-Be specific — reference exact policy details when provided.
+Be specific — reference exact policy details, dollar amounts, and seat counts when provided.
 Never make promises that aren't supported by the policy context.
 Do NOT include a subject line. Start directly with the greeting.
-Keep the reply under 200 words unless the situation demands more detail.
+Keep the reply under 250 words unless the situation demands more detail.
+
+CRITICAL SAFETY RULES:
+- NEVER say "our chatbot made an error" or "the chatbot was wrong" — liability risk.
+- NEVER say "we take full responsibility" for operational issues — liability risk.
+- NEVER fabricate technical details (e.g. "new caching system", "server infrastructure fix").
+- NEVER blame the customer for not responding or not understanding.
+
+IMPORTANT TONE RULES:
+- If unanswered emails or churn threat: be empathetic and apologetic, NOT defensive.
+- Acknowledge their frustration: "I understand your frustration"
+- Use: "We appreciate your patience" instead of admitting fault.
+- Use: "Let me clarify our policy" instead of "our system was wrong".
+- For chatbot issues: "There may have been confusion in how the information was presented"
+  instead of "the chatbot gave wrong info".
+
+RETENTION OFFER RULES:
+- If churn risk high: include specific retention offer (e.g. "We'd like to offer you one month free").
+- Format: "As a gesture of goodwill, we'd like to offer [specific benefit]"
+- Never say "I'm sorry for the error" — say "I appreciate your patience"
+
+PRO-RATA BILLING RULES — READ CAREFULLY:
+- Pro-rata applies ONLY to NEW seats being added, never to existing seats.
+- TWO MANDATORY STEPS — always show both:
+  Step 1 (undiscounted): new_seats x per_seat_price x (days_remaining / total_days)
+  Step 2 (apply discount): Step 1 result x (1 - discount_rate)
+- Present as two labelled lines then a final total. Worked example:
+    Undiscounted: 5 new seats x $12/seat x (15/30 days) = $30.00
+    After 30% non-profit discount: $30.00 x 0.70 = $21.00
+    Total due: $21.00
+- NEVER skip Step 2. If the customer has ANY discount it MUST be applied before showing the total.
+- NEVER present the undiscounted subtotal as the final charge.
+- NEVER use a price-difference formula — that is for PLAN UPGRADES only, not seat additions.
+- NEVER invent a base price, original price, or price difference for seat additions.
+
 End with: Best regards,\nCustomer Success Team"""
 
     user = f"""Draft a {tone} email reply for the following situation:
@@ -291,7 +444,7 @@ SITUATION:
 {context}
 
 {f'RELEVANT POLICY:{chr(10)}{policy_context}' if policy_context else ''}
-
+{web_intel_section}
 Start with: {greeting},
 """
 
@@ -314,10 +467,19 @@ Start with: {greeting},
 
         draft = data["message"]["content"].strip()
 
+        result_data: dict = {"draft": draft, "tone": tone}
+        if web_intel_payload:
+            result_data["web_intel"] = web_intel_payload
+            result_data["web_intel_used"] = True
+
         return ToolResult(
             ok=True,
-            data={"draft": draft, "tone": tone},
-            summary=f"Draft reply generated ({len(draft)} chars, tone={tone}).",
+            data=result_data,
+            summary=(
+                f"Draft reply generated ({len(draft)} chars, tone={tone}"
+                + (", web intel injected" if web_intel_payload else "")
+                + ")."
+            ),
         )
 
     except Exception as e:
@@ -338,19 +500,13 @@ async def escalate_to_human(
 ) -> ToolResult:
     """
     Creates an escalation Action record and marks the email as Escalated.
-
-    Args:
-        email_id:          DB primary key of the email
-        reason:            Why it's being escalated (goes into reasoning log)
-        escalation_target: Who to escalate to (e.g. "customer_success@company.com")
-        proposed_reply:    Optional draft the human can edit before sending
     """
     try:
         email = db.query(Email).filter(Email.id == email_id).first()
         if not email:
             return ToolResult(ok=False, error=f"Email {email_id} not found", summary="Escalation failed — email not found.")
 
-        email.status       = "Escalated"
+        email.status        = "Escalated"
         email.requires_human = True
         db.commit()
 
@@ -400,19 +556,13 @@ async def flag_for_legal(
 ) -> ToolResult:
     """
     Flags an email for the legal/compliance team and creates an Action record.
-
-    issue_type examples: "GDPR-Article20", "GDPR-Article17", "ransomware",
-                         "cease-and-desist", "litigation-threat", "HIPAA-BAA"
-
-    Used for: GDPR requests, legal threats, compliance obligations.
-    Always sets requires_human=True and creates a Legal-Flag action.
     """
     try:
         email = db.query(Email).filter(Email.id == email_id).first()
         if not email:
             return ToolResult(ok=False, error=f"Email {email_id} not found", summary="Legal flag failed — email not found.")
 
-        email.status        = "Escalated"
+        email.status         = "Escalated"
         email.requires_human = True
         db.commit()
 
@@ -453,3 +603,136 @@ async def flag_for_legal(
     except Exception as e:
         logger.error(f"flag_for_legal failed: {e}", exc_info=True)
         return ToolResult(ok=False, error=str(e), summary=f"Legal flag error: {e}")
+
+
+# ─────────────────────────────────────────
+# Tool 7 — create_internal_ticket
+# ─────────────────────────────────────────
+
+# Valid assignee → team name mappings for audit readability
+_TEAM_NAMES = {
+    "dpo@company.com":         "Data Protection / Legal",
+    "legal@company.com":       "Legal",
+    "security@company.com":    "Security",
+    "engineering@company.com": "Engineering",
+    "product@company.com":     "Product",
+    "support@company.com":     "Customer Support",
+    "customer_success@company.com": "Customer Success",
+    "ops@company.com":         "Operations",
+}
+
+_VALID_PRIORITIES = {"low", "medium", "high", "critical"}
+
+
+async def create_internal_ticket(
+    title: str,
+    body: str,
+    assignee: str,
+    priority: str = "medium",
+    db: Optional[Session] = None,
+    email_id: Optional[int] = None,
+) -> ToolResult:
+    """
+    Creates an internal support/engineering/compliance ticket.
+
+    In a production system this would POST to Jira, Linear, or an internal
+    ticketing system. Here we:
+      1. Validate inputs
+      2. Generate a ticket ID
+      3. Persist an Action record with action_type="Ticket-Created"
+      4. Return the ticket ID for the agent's reasoning trace
+
+    Args:
+        title:    Ticket title (required, max 200 chars)
+        body:     Ticket body with context (required)
+        assignee: Team email or address (e.g. dpo@company.com)
+        priority: low | medium | high | critical
+        db:       SQLAlchemy session (required if email_id provided)
+        email_id: Optional FK to link ticket to an email
+
+    Returns:
+        ToolResult with data["ticket_id"] and data["assignee"]
+    """
+    # ── Validate inputs ───────────────────────────────────────────────
+    if not title or not title.strip():
+        return ToolResult(
+            ok=False,
+            error="Ticket title is required.",
+            summary="Ticket creation failed — empty title.",
+        )
+
+    if not body or not body.strip():
+        return ToolResult(
+            ok=False,
+            error="Ticket body is required.",
+            summary="Ticket creation failed — empty body.",
+        )
+
+    priority_clean = priority.lower().strip()
+    if priority_clean not in _VALID_PRIORITIES:
+        priority_clean = "medium"
+        logger.warning(f"create_internal_ticket: invalid priority '{priority}' — defaulting to 'medium'")
+
+    title_clean = title.strip()[:200]
+
+    # ── Generate ticket ID ────────────────────────────────────────────
+    # Format: TKT-{YYYYMMDD}-{6-char hex}
+    ticket_id = f"TKT-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+
+    team_name = _TEAM_NAMES.get(assignee.lower(), assignee)
+
+    logger.info(
+        f"[create_internal_ticket] Ticket {ticket_id} created: "
+        f"'{title_clean}' → {team_name} (priority={priority_clean})"
+    )
+
+    # ── Persist to DB if session provided ────────────────────────────
+    if db is not None and email_id is not None:
+        try:
+            ticket_log = {
+                "ticket_id": ticket_id,
+                "title":     title_clean,
+                "body":      body[:2000],
+                "assignee":  assignee,
+                "team":      team_name,
+                "priority":  priority_clean,
+                "created_at": datetime.utcnow().isoformat(),
+                "status":    "open",
+            }
+
+            action = Action(
+                email_id=email_id,
+                agent_reasoning_log=[{
+                    "step":        "create_internal_ticket",
+                    "thought":     f"Creating {priority_clean}-priority ticket for {team_name}",
+                    "action":      "create_internal_ticket()",
+                    "observation": ticket_log,
+                }],
+                action_type="Ticket-Created",
+                proposed_content=f"[{ticket_id}] {title_clean}\n\nAssigned to: {team_name}\nPriority: {priority_clean}\n\n{body[:500]}",
+                is_approved=True,   # tickets are auto-created, no approval gate
+                executed_at=datetime.utcnow(),
+            )
+            db.add(action)
+            db.commit()
+
+        except Exception as e:
+            # Non-fatal — ticket ID is still returned so the agent can continue
+            logger.error(f"create_internal_ticket DB persist failed: {e}", exc_info=True)
+
+    return ToolResult(
+        ok=True,
+        data={
+            "ticket_id":  ticket_id,
+            "title":      title_clean,
+            "assignee":   assignee,
+            "team":       team_name,
+            "priority":   priority_clean,
+            "status":     "open",
+            "created_at": datetime.utcnow().isoformat(),
+        },
+        summary=(
+            f"Ticket {ticket_id} created: '{title_clean}' "
+            f"→ {team_name} (priority={priority_clean})."
+        ),
+    )

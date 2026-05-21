@@ -6,7 +6,7 @@ from db.models import Base
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/senai_crm")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://nidhigandhi@localhost:5432/senai_crm")
 
 # Create the engine — this is the connection to PostgreSQL
 engine = create_engine(DATABASE_URL, echo=False)
