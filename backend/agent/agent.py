@@ -332,9 +332,10 @@ class AgentReasoner:
         )
         if existing_action and not dry_run:
             logger.info(
-                f"[Agent][IDEMPOTENCY] Email {email.message_id} already has a '''
-                f"{existing_action.action_type} action (id={existing_action.id}) — '''
-                "skipping duplicate agent run."
+                "[Agent][IDEMPOTENCY] "
+                f"Email {email.message_id} already has a "
+                f"{existing_action.action_type} action "
+                f"(id={existing_action.id}) — skipping duplicate agent run."
             )
             return {
                 "email_id":        email_id,
